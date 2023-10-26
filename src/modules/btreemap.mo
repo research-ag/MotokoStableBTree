@@ -366,6 +366,160 @@ module {
       };
     };
 
+    /// Gets or inserts a key-value pair into the map.
+    ///
+    /// The previous value of the key, if present, is returned, otherwise inserted value is returned.
+    ///
+    /// The size of the key/value must be <= the max key/value sizes configured
+    /// for the map. Otherwise, an `InsertError` is returned.
+    public func getOrInsert(
+      k: K,
+      key_converter: BytesConverter<K>,
+      v: V,
+      value_converter: BytesConverter<V>
+    ) : Result<V, InsertError> {
+      let key = key_converter.to_bytes(k);
+      let value = value_converter.to_bytes(v);
+
+      // Verify the size of the key.
+      let max_key_size = Nat32.toNat(key_converter.max_size);
+      if (key.size() > max_key_size) {
+        return #err(#KeyTooLarge {
+          given = key.size();
+          max = max_key_size;
+        });
+      };
+
+      // Verify the size of the value.
+      let max_value_size = Nat32.toNat(value_converter.max_size);
+      if (value.size() > max_value_size) {
+        return #err(#ValueTooLarge {
+          given = value.size();
+          max = max_value_size;
+        });
+      };
+
+      let root = do {
+        if (root_addr_ == Constants.NULL) {
+          // No root present. Allocate one.
+          let node = allocateNode(#Leaf);
+          root_addr_ := node.getAddress();
+          save();
+          node;
+        } else {
+          // Load the root from memory.
+          var root = loadNode(root_addr_);
+
+          // Check if the key already exists in the root.
+          switch(root.getKeyIdx(key)) {
+            case(#ok(idx)){
+              // The key exists. Return the previous value.
+              let (_, previous_value) = root.getEntry(idx);
+              return #ok(value_converter.from_bytes(previous_value));
+            };
+            case(#err(_)){
+              // If the root is full, we need to introduce a new node as the root.
+              //
+              // NOTE: In the case where we are overwriting an existing key, then introducing
+              // a new root node isn't strictly necessary. However, that's a micro-optimization
+              // that adds more complexity than it's worth.
+              if (root.isFull()) {
+                // The root is full. Allocate a new node that will be used as the new root.
+                var new_root = allocateNode(#Internal);
+      
+                // The new root has the old root as its only child.
+                new_root.addChild(root_addr_);
+      
+                // Update the root address.
+                root_addr_ := new_root.getAddress();
+                save();
+      
+                // Split the old (full) root. 
+                splitChild(new_root, 0);
+      
+                new_root;
+              } else {
+                root;
+              };
+            };
+          };
+        };
+      };
+      #ok(value_converter.from_bytes(getOrInsertNonFull(root, key, value)));
+    };
+
+    // Gets or inserts an entry into a node that is *not full*.
+    func getOrInsertNonFull(node: Node, key: Blob, value: Blob) : Blob {
+      // We're guaranteed by the caller that the provided node is not full.
+      assert(not node.isFull());
+
+      // Look for the key in the node.
+      switch(node.getKeyIdx(key)){
+        case(#ok(idx)){
+          // The key is already in the node.
+          // Return the previous value.
+          let (_, previous_value) = node.getEntry(idx);
+
+          return previous_value;
+        };
+        case(#err(idx)){
+          // The key isn't in the node. `idx` is where that key should be inserted.
+
+          switch(node.getNodeType()) {
+            case(#Leaf){
+              // The node is a non-full leaf.
+              // Insert the entry at the proper location.
+              node.insertEntry(idx, (key, value));
+              
+              node.save(memory_);
+
+              // Update the length.
+              length_ += 1;
+              save();
+
+              // No previous value to return.
+              return value;
+            };
+            case(#Internal){
+              // The node is an internal node.
+              // Load the child that we should add the entry to.
+              var child = loadNode(node.getChild(idx));
+
+              if (child.isFull()) {
+                // Check if the key already exists in the child.
+                switch(child.getKeyIdx(key)) {
+                  case(#ok(idx)){
+                    // The key exists. Return the previous value.
+                    let (_, previous_value) = child.getEntry(idx);
+
+                    return previous_value;
+                  };
+                  case(#err(_)){
+                    // The child is full. Split the child.
+                    splitChild(node, idx);
+
+                    // The children have now changed. Search again for
+                    // the child where we need to store the entry in.
+                    let index = switch(node.getKeyIdx(key)){
+                      case(#ok(i))  { i; };
+                      case(#err(i)) { i; };
+                    };
+
+                    child := loadNode(node.getChild(index));
+                  };
+                };
+              };
+
+              // The child should now be not full.
+              assert(not child.isFull());
+
+              getOrInsertNonFull(child, key, value);
+            };
+          };
+        };
+      };
+    };
+
     // Takes as input a nonfull internal `node` and index to its full child, then
     // splits this child into two, adding an additional child to `node`.
     //

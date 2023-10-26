@@ -42,6 +42,15 @@ module {
     };
   };
 
+  public func getOrPut<K, V>(btree: BTree<K, V>, key_conv: BytesConverter<K>, key: K, value_conv: BytesConverter<V>, value: V) : V {
+    let btreemap = loadBTreeMap<K, V>(btree);
+    switch(btreemap.getOrInsert(key, key_conv, value, value_conv)){
+      case(#err(#KeyTooLarge  ({ given; max; }))){ Debug.trap("The key is too large: { max = " # Nat.toText(max) # ", given = " # Nat.toText(given) # " }") };
+      case(#err(#ValueTooLarge({ given; max; }))){ Debug.trap("The value is too large: { max = " # Nat.toText(max) # ", given = " # Nat.toText(given) # " }") };
+      case(#ok(v)) { v; };
+    };
+  };
+
   public func get<K, V>(btree: BTree<K, V>, key_conv: BytesConverter<K>, key: K, value_conv: BytesConverter<V>) : ?V {
     let btreemap = loadBTreeMap<K, V>(btree);
     btreemap.get(key, key_conv, value_conv);
